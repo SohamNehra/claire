@@ -1,0 +1,85 @@
+#!/bin/bash
+# Launcher for Claire. Starts llama-server if it isn't already up, then runs
+# the agent in whatever directory you're currently in.
+#
+#   claire                  interactive
+#   claire "fix the bug"    one-shot
+#   claire --yolo "..."     skip command approval
+#
+# All settings live in config.py next to this script. Do not edit paths here.
+
+set -euo pipefail
+
+# Resolve symlinks so this works when linked into ~/.local/bin.
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  DIR="$(cd -P "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  [[ "$SRC" != /* ]] && SRC="$DIR/$SRC"
+done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+
+# Single source of truth: config.py emits the values bash needs, so the launcher
+# and the agent can never disagree about model, port or context.
+eval "$(python3 "$HERE/config.py" --sh)"
+
+MODEL_GGUF="$CLAIRE_MODEL_GGUF"
+HOST="$CLAIRE_HOST"
+PORT="$CLAIRE_PORT"
+LOG="$CLAIRE_SERVER_LOG"
+
+# CONTEXT=0 in config.py means "use the model's trained maximum", which is
+# llama.cpp's own `-c 0`. CLAIRE_CTX still overrides for a one-off run.
+CTX="${CLAIRE_CTX:-$CLAIRE_CTX_CONF}"
+
+if [ "$CLAIRE_AUTOSTART" = "1" ] &&
+   ! curl -sf --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+  echo "  starting llama-server..."
+
+  if [ ! -f "$MODEL_GGUF" ]; then
+    echo "  ERROR: model not found at:"
+    echo "    $MODEL_GGUF"
+    echo "  Set MODEL_GGUF in $HERE/config.py"
+    exit 1
+  fi
+
+  if ! command -v llama-server >/dev/null 2>&1; then
+    echo "  ERROR: llama-server is not on your PATH."
+    echo "  Install llama.cpp, or set AUTOSTART_SERVER = False in config.py"
+    echo "  and point API_BASE at a server you run yourself."
+    exit 1
+  fi
+
+  # A KV cache is allocated up front, so an unbounded context can exhaust RAM
+  # before the model finishes loading. Cap it unless the user asked for more.
+  if [ "$CTX" = "0" ] && [ -n "$CLAIRE_CTX_CEILING" ]; then
+    CTX="$CLAIRE_CTX_CEILING"
+  fi
+
+  # shellcheck disable=SC2086
+  nohup llama-server \
+    -m "$MODEL_GGUF" \
+    --jinja \
+    -c "$CTX" \
+    -ctk "$CLAIRE_KV" -ctv "$CLAIRE_KV" \
+    -ngl "$CLAIRE_NGL" \
+    --port "$PORT" \
+    --host "$HOST" \
+    $CLAIRE_EXTRA_ARGS \
+    > "$LOG" 2>&1 &
+
+  for _ in $(seq 1 60); do
+    if curl -sf --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+      echo "  server ready."
+      break
+    fi
+    sleep 1
+  done
+
+  if ! curl -sf --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+    echo "  ERROR: server did not come up. Check $LOG"
+    exit 1
+  fi
+fi
+
+exec python3 "$HERE/claire.py" "$@"
