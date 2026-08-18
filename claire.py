@@ -110,9 +110,16 @@ IO_LOCK = threading.Lock()
 C = {
     "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
     "nobold": "\033[22m",   # turns bold off without the full-reset that "reset" does
-    "pink": "\033[95m", "blue": "\033[94m", "green": "\033[92m",
-    "yellow": "\033[93m", "red": "\033[91m", "cyan": "\033[96m",
-    "white": "\033[97m",
+    # 24-bit truecolor instead of the basic 16-color codes: the old "pink" was
+    # ANSI bright-magenta (95), which most terminal themes render as a dull
+    # purple, not pink. Explicit RGB gives the real color regardless of theme.
+    "pink": "\033[38;2;255;105;180m",    # hot pink
+    "blue": "\033[38;2;78;168;255m",     # vivid sky blue
+    "green": "\033[38;2;74;222;128m",    # vivid green
+    "yellow": "\033[38;2;255;214;10m",   # vivid yellow
+    "red": "\033[38;2;255;92;92m",       # vivid red
+    "cyan": "\033[38;2;34;211;238m",     # vivid cyan
+    "white": "\033[38;2;255;255;255m",
 }
 if not sys.stdout.isatty():
     C = {k: "" for k in C}
@@ -493,11 +500,26 @@ SYSTEM_PROMPT = """You are Claire, a precise coding agent working in a real term
 
 You work in a loop: understand the task, find the relevant code, read it, change it, verify the change, report. One step per message.
 
-Each message you send is ONE tool call. Before the tool block, write a single short line of plain prose saying what you are about to do and why. That line is for your own reasoning -- it keeps you honest about whether the call you are about to make actually serves the task. Keep it to one line, and never put XML tags in it. This applies to <done> too: it is a tool call like any other, so it also gets a one-line rationale before it -- one line saying why the task is finished, distinct from the <summary> itself.
+Each message you send is normally ONE tool call. Before the tool block, write a single short line of plain prose saying what you are about to do and why. That line is for your own reasoning -- it keeps you honest about whether the call you are about to make actually serves the task. Keep it to one line, and never put XML tags in it. This applies to <done> too: it is a tool call like any other, so it also gets a one-line rationale before it -- one line saying why the task is finished, distinct from the <summary> itself.
+
+The one exception: read_file, list_files, and search_files are read-only and cannot affect each other, so when you need several independent lookups -- reading three files to compare them, say -- you may batch up to 3 of those calls in a single message, one rationale line covering all of them. Anything that writes, edits, or runs something (write_file, edit_file, run_command, git, and so on) always stays alone in its own message, one per turn, because ordering there matters and a batch of them can't be undone partway through.
 
     The handler is the only step I have not checked, reading it now.
     <read_file>
     <path>src/api/routes.py</path>
+    </read_file>
+
+When you already know you need several independent files and none of them depends on what's in the others, send all of the read_file calls together instead of one per step -- like this, not one now and the rest later:
+
+    None of these three depend on each other, reading all of them now.
+    <read_file>
+    <path>config.py</path>
+    </read_file>
+    <read_file>
+    <path>README.md</path>
+    </read_file>
+    <read_file>
+    <path>CLAUDE.md</path>
     </read_file>
 
 After each tool call you receive the result, then you continue. Never guess a file's contents -- read it first.
@@ -685,7 +707,7 @@ There is no bare-prose reply that skips this. For example:
 
 # Rules
 
-- ONE tool call per message. One line of prose before it, nothing after it. <done> is a tool call too -- it gets its rationale line before it, same as any other. This includes plain conversation: there is no reply that isn't wrapped in <done>.
+- ONE tool call per message, except read_file / list_files / search_files: being read-only, up to 3 of those may be batched in one message when they don't depend on each other. Everything else -- write_file, edit_file, run_command, git, <done>, all of it -- stays exactly one per message, one line of prose before it, nothing after. This includes plain conversation: there is no reply that isn't wrapped in <done>.
 - Read a file before editing it.
 - Paths are relative to the working directory. Never touch files outside it.
 - **Images**: the user can attach images by referencing a file path with `@` (e.g. `@screenshot.png`) or by pasting from the clipboard. When an image is attached, you will see it in the message. Describe what you see and use it to inform your answer.
@@ -920,6 +942,14 @@ none of your work knows exactly where things stand:
 
 Do not claim more certainty than your evidence supports. "Tests pass" is a fact.
 "This is now correct" is a claim, and it needs the fact behind it.
+
+This prints as plain text in a terminal, not a rendered markdown viewer, so
+whitespace is the only structure the user actually sees. Put a blank line
+between paragraphs, before each new heading or numbered section, and between
+list items whenever an item runs more than one line. A long summary with no
+blank lines reads as one dense block no matter how well-organized its content
+is -- space it out the way you would a message you want someone to actually
+read, not a transcript dump.
 """
 
 
@@ -1502,24 +1532,40 @@ def strip_reasoning(text):
     return text.strip()
 
 
-def parse_tool_call(text):
-    """Find the first tool block. Returns (name, args) or (None, reason)."""
+READ_ONLY_BATCHABLE = {"read_file", "list_files", "search_files"}
+MAX_BATCH = 3
+
+
+def parse_tool_calls(text):
+    """Find tool blocks in the reply. Returns a list of (name, args).
+
+    Normally just one, since that's the rule for anything that writes, edits,
+    or runs something -- order matters there and a batch can't be undone
+    partway through. But read_file/list_files/search_files are read-only and
+    independent of each other, so if the model sends several of those in one
+    message (e.g. reading three files to compare them), run all of them
+    instead of silently dropping everything after the first. Capped at
+    MAX_BATCH so a runaway reply can't turn into dozens of calls in one step.
+    A batch that mixes in anything else collapses to just its first call.
+    """
     text = strip_reasoning(text)
-    best = None
+    found = []
     for name in TOOLS:
-        m = re.search(rf"<{name}\s*>(.*?)</{name}\s*>", text, re.DOTALL)
-        if m and (best is None or m.start() < best[1].start()):
-            best = (name, m)
-    if best is None:
+        for m in re.finditer(rf"<{name}\s*>(.*?)</{name}\s*>", text, re.DOTALL):
+            found.append((m.start(), name, m))
+    if not found:
         # Recover an unclosed final tag, common on long outputs.
         for name in TOOLS:
             m = re.search(rf"<{name}\s*>(.*)", text, re.DOTALL)
             if m and name in ("write_file", "done"):
-                return name, _parse_params(m.group(1), name)
-        return None, "no tool call found"
+                return [(name, _parse_params(m.group(1), name))]
+        return []
 
-    name, m = best
-    return name, _parse_params(m.group(1), name)
+    found.sort(key=lambda t: t[0])
+    calls = [(name, _parse_params(m.group(1), name)) for _, name, m in found]
+    if not all(name in READ_ONLY_BATCHABLE for name, _ in calls):
+        return calls[:1]
+    return calls[:MAX_BATCH]
 
 
 def prose_outside(reply):
@@ -2217,10 +2263,22 @@ class Footer:
             sys.stdout.flush()
 
     def _resize(self):
-        """Re-apply the region after a window change, never touching the cursor."""
+        """Re-apply the region after a window change, never touching the cursor.
+
+        DECSTBM (CSI r) homes the cursor to 1;1 as a spec-mandated side effect --
+        it does NOT leave the cursor alone despite what this used to assume. Since
+        this runs from the background thread on every tick, we can't query the
+        real cursor row to fix that up (DSR reads from stdin, which would steal
+        keystrokes while the user is typing). Instead use the terminal's own
+        save/restore-cursor slot (ESC 7/8): it needs no stdin round-trip, so it's
+        safe here, and it undoes the home-jump with no knowledge of where the
+        cursor actually was.
+        """
         self.rows, _ = self._size()
         with IO_LOCK:
+            sys.stdout.write("\0337")
             sys.stdout.write(f"\033[1;{max(self.rows - 1, 1)}r")
+            sys.stdout.write("\0338")
             sys.stdout.flush()
 
     def _release(self):
@@ -2244,9 +2302,16 @@ class Footer:
 
     def _run(self):
         while not self._stop.wait(0.15):
-            if self.rows != self._size()[0]:
-                self._resize()   # never _reserve() here: it reads stdin, which
-                                 # would steal keystrokes mid-typing
+            # Reassert the margin every tick, not just when get_terminal_size()
+            # changes: most emulators (VS Code's xterm.js included) silently reset
+            # DECSTBM margins to full-screen on ANY resize, including width-only
+            # ones that leave the row count -- the only thing we used to check --
+            # unchanged. Missing that reset let real output scroll straight over
+            # the "reserved" row, dragging old footer text into the scrollback as
+            # duplicate lines. _resize() never touches the cursor, so doing it
+            # unconditionally is cheap and safe even when nothing changed.
+            self._resize()   # never _reserve() here: it reads stdin, which
+                             # would steal keystrokes mid-typing
             self.paint()
 
     def start(self):
@@ -2361,7 +2426,8 @@ def run_task(task, messages):
                              "one XML tool call and nothing else."})
             continue
 
-        name, args = parse_tool_call(reply)
+        calls = parse_tool_calls(reply)
+        name, args = calls[0] if calls else (None, None)
 
         if name is None:
             # Conversation, not a task. "hey bud" gets answered in prose with no
@@ -2458,30 +2524,35 @@ def run_task(task, messages):
                 print()
             return
 
-        detail = (args.get("path") or args.get("command")
-                  or args.get("pattern") or args.get("url") or "")
-        print(f"  {c('⏺', 'cyan')} {c(name, 'cyan')} "
-              f"{c(str(detail)[:term_width() - 30], 'bold')}{depth} "
-              f"{c(f'{elapsed:.0f}s', 'dim')}")
+        # Normally just one call. When the model batches several independent
+        # read-only lookups (read_file/list_files/search_files) in one message,
+        # `calls` has up to MAX_BATCH entries here -- run every one and feed
+        # back every result before the next model turn.
+        for name, args in calls:
+            detail = (args.get("path") or args.get("command")
+                      or args.get("pattern") or args.get("url") or "")
+            print(f"  {c('⏺', 'cyan')} {c(name, 'cyan')} "
+                  f"{c(str(detail)[:term_width() - 30], 'bold')}{depth} "
+                  f"{c(f'{elapsed:.0f}s', 'dim')}")
 
-        try:
-            result = HANDLERS[name](args)
-        except ValueError as e:
-            result = f"ERROR: {e}"
-        except Exception as e:
-            result = f"ERROR: {type(e).__name__}: {e}"
+            try:
+                result = HANDLERS[name](args)
+            except ValueError as e:
+                result = f"ERROR: {e}"
+            except Exception as e:
+                result = f"ERROR: {type(e).__name__}: {e}"
 
-        first = result.splitlines()[0] if result else ""
-        failed = (result.startswith("ERROR")
-                  or re.search(r"exit=[1-9]", first) is not None)
-        if failed:
-            boost_left = max(boost_left, 2)   # a failing step earns more thought
-        mark = c("✗", "red") if failed else c("└", "dim")
-        body = c(first[:term_width() - 8], "red" if failed else "white")
-        print(f"    {mark} {body}")
+            first = result.splitlines()[0] if result else ""
+            failed = (result.startswith("ERROR")
+                      or re.search(r"exit=[1-9]", first) is not None)
+            if failed:
+                boost_left = max(boost_left, 2)   # a failing step earns more thought
+            mark = c("✗", "red") if failed else c("└", "dim")
+            body = c(first[:term_width() - 8], "red" if failed else "white")
+            print(f"    {mark} {body}")
 
-        messages.append({"role": "user",
-                         "content": f"[{name} result]\n{result}"})
+            messages.append({"role": "user",
+                             "content": f"[{name} result]\n{result}"})
 
     print(c(f"\n  hit the {MAX_STEPS}-step cap. Task may be incomplete.", "yellow"))
 
