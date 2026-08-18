@@ -519,7 +519,7 @@ When you already know you need several independent files and none of them depend
     <path>README.md</path>
     </read_file>
     <read_file>
-    <path>CLAUDE.md</path>
+    <path>CLAIRE.md</path>
     </read_file>
 
 After each tool call you receive the result, then you continue. Never guess a file's contents -- read it first.
