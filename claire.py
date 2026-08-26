@@ -16,7 +16,6 @@ import json
 import mimetypes
 import os
 import re
-import signal
 import shutil
 import subprocess
 import sys
@@ -2217,184 +2216,10 @@ def status_bar():
 
 
 
-def _visible_len(text):
-    """Length of text as the terminal renders it, ignoring colour codes."""
-    return len(re.sub(r"\033\[[0-9;]*m|\001|\002", "", text))
-
-
-class Footer:
-    """A status line pinned to the bottom row of the terminal.
-
-    Uses DECSTBM (CSI top;bottom r) to shrink the scrolling region to every row
-    but the last. Normal output then scrolls within that region and physically
-    cannot touch the bottom row, so the bar stays put while text streams above
-    it -- no repainting the world, no alternate screen, scrollback intact.
-
-    A repaint thread keeps it correct without every print site having to know
-    about it. All writes go through IO_LOCK so they cannot interleave with the
-    spinner's own cursor moves.
-    """
-
-    def __init__(self, render):
-        self.render = render
-        self.enabled = False
-        self._stop = threading.Event()
-        self._thread = None
-        self.rows = 0
-
-    # -- terminal geometry ------------------------------------------------
-    def _size(self):
-        try:
-            size = os.get_terminal_size()
-            return size.lines, size.columns
-        except OSError:
-            return 24, 80
-
-    def _cursor_row(self):
-        """Ask the terminal where the cursor is (DSR). None if it won't answer.
-
-        Only safe before readline is active: it reads from stdin, so calling it
-        while the user is typing would swallow their keystrokes.
-        """
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            return None
-        try:
-            import select
-            import termios
-            import tty
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                sys.stdout.write("\033[6n")
-                sys.stdout.flush()
-                buf, end = "", time.time() + 0.3
-                while time.time() < end and "R" not in buf:
-                    if select.select([fd], [], [], 0.05)[0]:
-                        buf += os.read(fd, 32).decode("ascii", "replace")
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            m = re.search(r"\[(\d+);(\d+)R", buf)
-            return int(m.group(1)) if m else None
-        except Exception:
-            return None
-
-    def _reserve(self):
-        """Shrink the scrolling region, WITHOUT moving the cursor down.
-
-        Jumping the cursor to the bottom of the region is what produced a screen
-        full of blank lines: the terminal had only drawn a dozen rows, and
-        parking the cursor on row H-1 left everything above it empty.
-        """
-        self.rows, _ = self._size()
-        bottom = max(self.rows - 1, 1)
-        row = self._cursor_row()
-        with IO_LOCK:
-            sys.stdout.write(f"\033[1;{bottom}r")
-            if row is not None and row <= bottom:
-                sys.stdout.write(f"\033[{row};1H")   # stay exactly where we were
-            else:
-                # Unknown, or already on the reserved row: take one line of room.
-                sys.stdout.write(f"\033[{bottom};1H\n")
-            sys.stdout.flush()
-
-    def _resize(self):
-        """Re-apply the region after a window change, never touching the cursor.
-
-        DECSTBM (CSI r) homes the cursor to 1;1 as a spec-mandated side effect --
-        it does NOT leave the cursor alone despite what this used to assume. Since
-        this runs from the background thread on every tick, we can't query the
-        real cursor row to fix that up (DSR reads from stdin, which would steal
-        keystrokes while the user is typing). Instead use the terminal's own
-        save/restore-cursor slot (ESC 7/8): it needs no stdin round-trip, so it's
-        safe here, and it undoes the home-jump with no knowledge of where the
-        cursor actually was.
-        """
-        self.rows, _ = self._size()
-        with IO_LOCK:
-            sys.stdout.write("\0337")
-            sys.stdout.write(f"\033[1;{max(self.rows - 1, 1)}r")
-            sys.stdout.write("\0338")
-            sys.stdout.flush()
-
-    def _release(self):
-        with IO_LOCK:
-            sys.stdout.write(f"\033[1;{self.rows}r")   # full-screen region again
-            sys.stdout.write(f"\033[{self.rows};1H\033[2K")
-            sys.stdout.flush()
-
-    # -- painting ---------------------------------------------------------
-    def paint(self):
-        if not self.enabled:
-            return
-        line = self.render()
-        with IO_LOCK:
-            # Save cursor, jump to the reserved row, redraw, jump back.
-            sys.stdout.write("\0337")
-            sys.stdout.write(f"\033[{self.rows};1H\033[2K")
-            sys.stdout.write(line[:_visible_len(line) + 2000])
-            sys.stdout.write("\0338")
-            sys.stdout.flush()
-
-    def _run(self):
-        while not self._stop.wait(0.15):
-            # Reassert the margin every tick, not just when get_terminal_size()
-            # changes: most emulators (VS Code's xterm.js included) silently reset
-            # DECSTBM margins to full-screen on ANY resize, including width-only
-            # ones that leave the row count -- the only thing we used to check --
-            # unchanged. Missing that reset let real output scroll straight over
-            # the "reserved" row, dragging old footer text into the scrollback as
-            # duplicate lines. _resize() never touches the cursor, so doing it
-            # unconditionally is cheap and safe even when nothing changed.
-            self._resize()   # never _reserve() here: it reads stdin, which
-                             # would steal keystrokes mid-typing
-            self.paint()
-
-    def start(self):
-        if not (sys.stdout.isatty() and _conf("STICKY_STATUS", True)):
-            return
-        self.enabled = True
-        self._reserve()
-        self.paint()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        if not self.enabled:
-            return
-        self.enabled = False
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=0.5)
-        self._release()
-
-
-FOOTER = Footer(lambda: status_bar())
-
-
 def prompt_and_read(prompt):
-    """Draw the status bar, read a line, then leave no status in the scrollback.
-
-    The bar sits directly above the prompt, so it is always the last thing on
-    screen while you type. On submit we wipe both the bar and the prompt line,
-    then re-echo just what was typed -- so the transcript you scroll back through
-    is your commands and Claire's replies, with no repeated chrome between them.
-    """
-    # The footer owns the bottom row; the prompt just prints normally inside the
-    # scrolling region above it. Nothing to erase, nothing to rewind.
-    if not FOOTER.enabled:
-        print(status_bar())
+    """Print the status bar, then read a line."""
+    print(status_bar())
     return read_task(prompt)
-
-
-def _done_ctx_suffix():
-    """Context meter appended to a `done` line -- omitted when the sticky
-    footer already shows it continuously, so the bar isn't printed twice
-    (once in the scrollback, once pinned) for every single turn."""
-    if FOOTER.enabled:
-        return ""
-    return f"  {ctx_bar(CTX_USED[0], CTX_LIMIT)}"
 
 
 def run_task(task, messages):
@@ -2480,7 +2305,7 @@ def run_task(task, messages):
                 messages.append({"role": "assistant", "content": reply})
                 with IO_LOCK:
                     print(f"  {c('✔', 'green')} {c('done', 'green')}{depth} "
-                          f"{c(f'{elapsed:.0f}s', 'dim')}{_done_ctx_suffix()}")
+                          f"{c(f'{elapsed:.0f}s', 'dim')}")
                     print()
                     print(f"  {c('●', 'pink')} {c('claire', 'pink')}")
                     for line in _wrap(spoken, term_width() - 6):
@@ -2549,10 +2374,10 @@ def run_task(task, messages):
                     _stream_finish(final_raw, max(30, term_width() - 6))
                     print(C["reset"] + "\n")
                     print(f"  {c('✔', 'green')} {c('done', 'green')}{depth} "
-                          f"{c(f'{elapsed:.0f}s', 'dim')}{_done_ctx_suffix()}")
+                          f"{c(f'{elapsed:.0f}s', 'dim')}")
                 else:
                     print(f"  {c('✔', 'green')} {c('done', 'green')}{depth} "
-                          f"{c(f'{elapsed:.0f}s', 'dim')}{_done_ctx_suffix()}")
+                          f"{c(f'{elapsed:.0f}s', 'dim')}")
                     print()
                     print(f"  {c('●', 'pink')} {c('claire', 'pink')}")
                     for line in _wrap(summary, term_width() - 6):
@@ -2621,17 +2446,6 @@ def main():
     print(c("  Type a task, or 'exit'.  Ctrl-C interrupts a running task.", "dim"))
     print(c("  Attach images: @path/to/image.png  or  [image: path.png]", "dim"))
     print(c("  /t thinking   /y yolo   reset   exit\n", "dim"))
-
-    # A scroll region outlives the process if we do not put it back, which would
-    # leave the user's shell unable to use the bottom row. Register the reset
-    # before starting, so it runs on a crash or a kill as well as a clean exit.
-    atexit.register(FOOTER.stop)
-    for _sig in (signal.SIGTERM, signal.SIGHUP):
-        try:
-            signal.signal(_sig, lambda *_a: (FOOTER.stop(), sys.exit(0)))
-        except (ValueError, OSError):
-            pass                      # not the main thread, or unsupported
-    FOOTER.start()
 
     while True:
         try:
